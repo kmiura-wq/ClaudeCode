@@ -109,10 +109,10 @@ def stagesync(hours, dry_run):
     cands = get_new_since(since_dt)
     staged, skipped, warn = [], [], []
     for c in cands:
-        ch = c.get("channelName") or ""
-        is_biz = ("ビズリーチ" in ch) or ("bizreach" in ch.lower())
+        # 対象範囲（2026-07-21変更）：エージェント経由のみ（channelType=agent）。
+        # ビズリーチ等スカウト媒体は選定〜返信〜面談調整に人の判断が介在するため除外。
         is_agent = c.get("channelType") == "agent"
-        if not (is_biz or is_agent):
+        if not is_agent:
             continue
         req_name = c.get("requisition", {}).get("name") if isinstance(c.get("requisition"), dict) else ""
         who = "id=%s %s%s [%s]" % (c.get("id"), c.get("lastName") or "", c.get("firstName") or "", req_name)
