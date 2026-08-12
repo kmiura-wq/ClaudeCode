@@ -7,13 +7,20 @@
 #   python3 talentio_client.py stagesync --hours 18 [--dry-run]
 #   python3 talentio_client.py tagsync --hours 168 [--dry-run]
 #   python3 talentio_client.py rejected --days 14
-import os, sys, json, argparse, datetime
+import os, sys, json, argparse, datetime, time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 BASE = "https://talentio.com/api/v1"
 JST = datetime.timezone(datetime.timedelta(hours=9))
 RESUME_FORM_ID = 717  # 書類選考「合格 or 不合格」評価フォーム
+
+# クラウド実行時の接続リセット対策（2026-08-12）。
+# データセンターIPから毎秒4件級のバーストで叩くとTalentio側に接続を切られる事象が発生した。
+# GET_DELAY で流量を抑え、_get は一過性の失敗を指数バックオフで自力リトライする
+# （以前は1回のリセットでコマンド全体が sys.exit していた）。
+GET_DELAY = 0.15   # 各GETの前に入れる待機秒数
+GET_RETRIES = 4    # 接続エラー/429/5xx の再試行回数
 
 
 def _token():
@@ -24,15 +31,25 @@ def _token():
 
 
 def _get(path):
-    req = Request(BASE + path, headers={"Authorization": "Bearer " + _token()})
-    try:
-        with urlopen(req, timeout=60) as r:
-            headers = {k.lower(): v for k, v in r.getheaders()}
-            return headers, json.loads(r.read().decode("utf-8"))
-    except HTTPError as e:
-        sys.exit("[API ERROR] GET %s -> HTTP %s: %s" % (path, e.code, e.read().decode("utf-8", "ignore")[:200]))
-    except URLError as e:
-        sys.exit("[API ERROR] GET %s -> %s" % (path, e))
+    last = ""
+    for attempt in range(GET_RETRIES):
+        if attempt:
+            time.sleep(2 ** attempt)  # 2s, 4s, 8s
+        else:
+            time.sleep(GET_DELAY)
+        req = Request(BASE + path, headers={"Authorization": "Bearer " + _token()})
+        try:
+            with urlopen(req, timeout=60) as r:
+                headers = {k.lower(): v for k, v in r.getheaders()}
+                return headers, json.loads(r.read().decode("utf-8"))
+        except HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")[:200]
+            last = "HTTP %s: %s" % (e.code, body)
+            if e.code != 429 and e.code < 500:
+                sys.exit("[API ERROR] GET %s -> %s" % (path, last))  # 4xxは再試行しても無駄
+        except (URLError, OSError) as e:
+            last = str(e)  # Connection reset by peer 等
+    sys.exit("[API ERROR] GET %s -> %s (after %d attempts)" % (path, last, GET_RETRIES))
 
 
 def _post(path, body):
