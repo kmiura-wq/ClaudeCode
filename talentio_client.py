@@ -260,66 +260,115 @@ def tagsync(hours, dry_run):
 
 
 # ---- Rejected candidates (for farewell-mail drafting) ----
-def rejected(days):
-    """エージェント経由で書類選考お見送り(resume fail)が確定した候補者を列挙する。
-    stageStatuses の有効値は fail / pass / on_evaluating / evaluated_all（2026-08-11検証）。
-    ※「未処理かどうか」は呼び出し側がNotion判定ログDBの記録で判断する（時間で近似しない）。
+def _resume_evaluation(cid):
+    """詳細APIから resume 評価の【理由】原文・合否・評価日時を取得する。
+
+    合否は items[name=="合否"] の **input**（bool: False=お見送り / True=通過）に入る。
+    comment は常に空なので、そちらを見ても判定は取れない（2026-08-12に画面と突合して判明）。
     """
+    _, detail = _get("/candidates/%s" % cid)
+    reason, verdict, ev_at = "", None, None
+    for s in ((detail or {}).get("stages") or []):
+        if s.get("type") != "resume":
+            continue
+        for e in (s.get("evaluations") or []):
+            t = _parse_dt(e.get("evaluatedAt"))
+            if t and (ev_at is None or t > ev_at):
+                ev_at = t
+            for it in (e.get("items") or []):
+                nm = it.get("name") or ""
+                if nm == "合否" and it.get("type") == "bool":
+                    verdict = it.get("input")
+                elif "理由" in nm:
+                    cm = (it.get("comment") or "").strip()
+                    if cm:
+                        reason = (reason + "\n" + cm).strip()
+    return reason, verdict, ev_at
+
+
+def _scan(bucket, days, pick):
+    """stageStatuses={bucket} を新しいページから遡り、pick(候補者, resumeステージ) が
+    dict を返したものを集める。ページは registeredAt 昇順なので最終ページ＝最新。"""
     since = datetime.datetime.now(JST) - datetime.timedelta(days=days)
-    out = []
-    headers, _first = _get("/candidates?stageStatuses=fail&page=1")
+    out, scanned = [], 0
+    headers, _first = _get("/candidates?stageStatuses=%s&page=1" % bucket)
     total = int(headers.get("x-total") or 0)
-    last_page = max(1, (total + 99) // 100)
-    scanned_pages = 0
-    p = last_page
-    while p >= 1 and scanned_pages < 30:
-        _, rows = _get("/candidates?stageStatuses=fail&page=%d" % p)
+    p = max(1, (total + 99) // 100)
+    while p >= 1 and scanned < 30:
+        _, rows = _get("/candidates?stageStatuses=%s&page=%d" % (bucket, p))
         rows = [] if not rows else ([rows] if isinstance(rows, dict) else rows)
-        scanned_pages += 1
+        scanned += 1
         if not rows:
             p -= 1
             continue
-        newest_reg = max([(_parse_dt(c.get("registeredAt")) or datetime.datetime.min.replace(tzinfo=JST)) for c in rows])
+        newest = max([(_parse_dt(c.get("registeredAt")) or datetime.datetime.min.replace(tzinfo=JST)) for c in rows])
         for c in rows:
             if c.get("channelType") != "agent":
                 continue
             r = None
             for s in (c.get("stages") or []):
-                if s.get("type") == "resume" and s.get("status") == "fail":
+                if s.get("type") == "resume":
                     r = s
-            if not r or not r.get("fixedAt"):
+            if not r:
                 continue
-            fx = _parse_dt(r.get("fixedAt"))
-            if not fx or fx < since:
-                continue
-            # 評価コメント(理由)は一覧APIに含まれないため、詳細APIから取得する
-            ev_reason = ""
-            _, detail = _get("/candidates/%s" % c.get("id"))
-            dr = None
-            for s in ((detail or {}).get("stages") or []):
-                if s.get("type") == "resume" and s.get("status") == "fail":
-                    dr = s
-            for e in ((dr or {}).get("evaluations") or []):
-                for it in (e.get("items") or []):
-                    if "理由" in (it.get("name") or ""):
-                        cm = (it.get("comment") or "").strip()
-                        if cm:
-                            ev_reason = (ev_reason + "\n" + cm).strip()
-            out.append({
-                "id": c.get("id"),
-                "name": ((c.get("lastName") or "") + (c.get("firstName") or "")),
-                "position": (c.get("requisition") or {}).get("name"),
-                "agentCompany": (c.get("agentCompany") or {}).get("name"),
-                "agentPerson": (c.get("agent") or {}).get("name"),
-                "fixedAt": r.get("fixedAt"),
-                "reason": ev_reason,
-                "url": c.get("url"),
-            })
-        if newest_reg < (since - datetime.timedelta(days=60)):
+            got = pick(c, r, since)
+            if got:
+                out.append(got)
+        if newest < (since - datetime.timedelta(days=60)):
             break
         p -= 1
+    return out
+
+
+def rejected(days):
+    """エージェント経由・書類選考お見送りの候補者を列挙する。
+
+    2種類を返す（finalized で区別）：
+      finalized=True  … 選考ステージが fail で確定済み（stageStatuses=fail）
+      finalized=False … 評価者は「お見送り」判定を出したが、Talentio画面上部の
+                        「お見送り／通過」ボタンによるステージ確定がまだ（evaluated_all）。
+                        2026-08-12にこの状態の4名が検知されず「通知が来ない」と報告された。
+                        判定は推測ではなく評価データ（合否のinput=False）から読んでいるので
+                        下書きを作って差し支えないが、**送信前にTalentioでの確定が必要**。
+    ※「未処理かどうか」は呼び出し側がNotion判定ログDBの記録で判断する（時間で近似しない）。
+    """
+    def base(c, r, reason, when, finalized):
+        return {
+            "id": c.get("id"),
+            "name": ((c.get("lastName") or "") + (c.get("firstName") or "")),
+            "position": (c.get("requisition") or {}).get("name"),
+            "agentCompany": (c.get("agentCompany") or {}).get("name"),
+            "agentPerson": (c.get("agent") or {}).get("name"),
+            "fixedAt": when,
+            "finalized": finalized,
+            "reason": reason,
+            "url": c.get("url"),
+        }
+
+    def pick_fail(c, r, since):
+        if r.get("status") != "fail" or not r.get("fixedAt"):
+            return None
+        fx = _parse_dt(r.get("fixedAt"))
+        if not fx or fx < since:
+            return None
+        reason, _v, _t = _resume_evaluation(c.get("id"))
+        return base(c, r, reason, r.get("fixedAt"), True)
+
+    def pick_unfinalized(c, r, since):
+        if r.get("fixedAt") or r.get("status") in ("fail", "pass"):
+            return None  # 確定済みは fail バケツ側で拾う
+        reason, verdict, ev_at = _resume_evaluation(c.get("id"))
+        if verdict is not False:   # True=通過 / None=未入力 は対象外
+            return None
+        if not ev_at or ev_at < since:
+            return None
+        return base(c, r, reason, ev_at.isoformat(), False)
+
+    out = _scan("fail", days, pick_fail) + _scan("evaluated_all", days, pick_unfinalized)
     out.sort(key=lambda x: x["fixedAt"], reverse=True)
-    print(json.dumps({"count": len(out), "candidates": out}, ensure_ascii=False, indent=2))
+    print(json.dumps({"count": len(out),
+                      "unfinalized": sum(1 for x in out if not x["finalized"]),
+                      "candidates": out}, ensure_ascii=False, indent=2))
 
 
 # ---- Pending finalization (合否未確定の検出) ----
