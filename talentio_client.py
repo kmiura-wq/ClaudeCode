@@ -7,6 +7,7 @@
 #   python3 talentio_client.py stagesync --hours 18 [--dry-run]
 #   python3 talentio_client.py tagsync --hours 168 [--dry-run]
 #   python3 talentio_client.py rejected --days 14
+#   python3 talentio_client.py pending --hours 2 --max-days 14
 import os, sys, json, argparse, datetime, time
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -321,6 +322,81 @@ def rejected(days):
     print(json.dumps({"count": len(out), "candidates": out}, ensure_ascii=False, indent=2))
 
 
+# ---- Pending finalization (合否未確定の検出) ----
+def pending(hours, max_days):
+    """評価は入力済みだが「合否」が未確定の候補者を検出する。
+
+    2026-08-12の事象：評価者が【理由】だけ記入し「合否」プルダウンを選ばないと、
+    stageはongoingのままでfixedAtも付かない。rejected（fail絞り込み）には現れず、
+    お見送りメールの下書きが永久に作られない。伏見さんからは「通知が来ない」と見える。
+    ※【理由】欄は合格時にも記入されるため、**文面から合否を推測してはいけない**。
+      このアクションは「確定を促すアラート」用であり、下書き生成には使わない。
+    """
+    cutoff = datetime.datetime.now(JST) - datetime.timedelta(hours=hours)
+    # max_days より古い滞留（2024年〜の放置分など）は日々のアラート対象外にする。
+    # 毎回通知に出ると新しい案件が埋もれるため。棚卸しは max_days を伸ばして手動実行する。
+    floor = datetime.datetime.now(JST) - datetime.timedelta(days=max_days)
+    horizon = datetime.datetime.now(JST) - datetime.timedelta(days=30)
+    out, stale = [], 0
+    headers, _first = _get("/candidates?stageStatuses=evaluated_all&page=1")
+    total = int(headers.get("x-total") or 0)
+    last_page = max(1, (total + 99) // 100)
+    scanned = 0
+    p = last_page
+    while p >= 1 and scanned < 10:
+        _, rows = _get("/candidates?stageStatuses=evaluated_all&page=%d" % p)
+        rows = [] if not rows else ([rows] if isinstance(rows, dict) else rows)
+        scanned += 1
+        if not rows:
+            p -= 1
+            continue
+        newest_reg = max([(_parse_dt(c.get("registeredAt")) or datetime.datetime.min.replace(tzinfo=JST)) for c in rows])
+        for c in rows:
+            if c.get("channelType") != "agent":
+                continue
+            r = None
+            for s in (c.get("stages") or []):
+                if s.get("type") == "resume":
+                    r = s
+            if not r:
+                continue
+            if r.get("fixedAt") or r.get("status") in ("fail", "pass"):
+                continue  # 既に確定済み＝rejected側の担当
+            # 評価入力時刻は一覧APIに無いため詳細APIから取る
+            _, detail = _get("/candidates/%s" % c.get("id"))
+            ev_at, has_reason = None, False
+            for s in ((detail or {}).get("stages") or []):
+                if s.get("type") != "resume":
+                    continue
+                for e in (s.get("evaluations") or []):
+                    t = _parse_dt(e.get("evaluatedAt"))
+                    if t and (ev_at is None or t > ev_at):
+                        ev_at = t
+                    for it in (e.get("items") or []):
+                        if "理由" in (it.get("name") or "") and (it.get("comment") or "").strip():
+                            has_reason = True
+            if not ev_at or ev_at > cutoff:
+                continue  # 未入力、または入力から間もない（確定作業中の可能性）
+            if ev_at < floor:
+                stale += 1
+                continue
+            out.append({
+                "id": c.get("id"),
+                "name": ((c.get("lastName") or "") + (c.get("firstName") or "")),
+                "position": (c.get("requisition") or {}).get("name"),
+                "agentCompany": (c.get("agentCompany") or {}).get("name"),
+                "evaluatedAt": ev_at.isoformat(),
+                "hasReason": has_reason,
+                "url": c.get("url"),
+            })
+        if newest_reg < horizon:
+            break
+        p -= 1
+    out.sort(key=lambda x: x["evaluatedAt"], reverse=True)
+    print(json.dumps({"count": len(out), "stale_excluded": stale, "candidates": out},
+                     ensure_ascii=False, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="action", required=True)
@@ -329,6 +405,7 @@ def main():
     s = sub.add_parser("stagesync"); s.add_argument("--hours", type=float, default=18); s.add_argument("--dry-run", action="store_true")
     g = sub.add_parser("tagsync"); g.add_argument("--hours", type=float, default=168); g.add_argument("--dry-run", action="store_true")
     rj = sub.add_parser("rejected"); rj.add_argument("--days", type=float, default=30)
+    pd = sub.add_parser("pending"); pd.add_argument("--hours", type=float, default=2); pd.add_argument("--max-days", type=float, default=14)
     args = ap.parse_args()
 
     if args.action == "new":
@@ -348,6 +425,8 @@ def main():
         tagsync(args.hours, args.dry_run)
     elif args.action == "rejected":
         rejected(args.days)
+    elif args.action == "pending":
+        pending(args.hours, args.max_days)
 
 
 if __name__ == "__main__":
