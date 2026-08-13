@@ -202,11 +202,18 @@ SCOUT_CHANNELS = ["ビズリーチ", "LAPRAS", "Findy", "YOUTRUST", "転職ド�
 
 
 def _desired_tags(c):
-    """求人番号とチャネルから一意に決まる属性タグのみを算出する。"""
+    """求人番号・チャネル・確定した選考結果から、一意に決まるタグを算出する。"""
     req_name = (c.get("requisition") or {}).get("name") or ""
     ch_name = c.get("channelName") or ""
     ch_type = c.get("channelType") or ""
     want = set()
+    # 選考フェーズタグは原則AIが触らないが、「書類選考が fail で確定」は
+    # 事実として一意に決まるため付与のみ行う（2026-08-12 伏見さん要望）。
+    # MANAGED_TAGS には入れない＝**追加のみ・除去はしない**。人が付けた他のフェーズタグ
+    # （通過－書類選考／○月面談済み 等）には一切手を触れない。
+    for s in (c.get("stages") or []):
+        if s.get("type") == "resume" and s.get("status") == "fail" and s.get("fixedAt"):
+            want.add("不合格－書類選考")
     if "28卒" in req_name:
         want.add("28卒")
         if any(k in req_name for k in ["ビジネス", "BPO", "セールス"]):
