@@ -453,6 +453,73 @@ def pending(hours, max_days):
                      ensure_ascii=False, indent=2))
 
 
+# ---- Awaiting decision (判定待ちの棚卸し) ----
+def awaiting(days):
+    """Talentioの「判定待ち」（評価は完了しているが合否が未確定）を、
+    評価者の判定内容で仕分けて返す。
+
+    2026-08-20 伏見さん要望：判定待ち一覧に「通過者」と「お見送り者」が混在し、
+    Talentioを 1件ずつ開いて閉じて確認する手間が発生している。
+    「通過者はこの人」をSlackで知らせるためのアクション。
+
+    分類：
+      pass_agent / pass_direct   … 評価者が「通過」判定→**人の対応が必要**
+      fail_agent                 … エージェント経由のお見送り→AIが下書きを出すので**待てばよい**
+      fail_direct                … 媒体直接応募のお見送り→AI対象外なので**人の対応が必要**
+      no_verdict                 … 合否が未入力（評価者待ち）
+    """
+    floor = datetime.datetime.now(JST) - datetime.timedelta(days=days)
+    now = datetime.datetime.now(JST)
+    groups = {"pass_agent": [], "pass_direct": [], "fail_agent": [], "fail_direct": [], "no_verdict": []}
+    stale = 0
+    headers, _first = _get("/candidates?stageStatuses=evaluated_all&page=1")
+    total = int(headers.get("x-total") or 0)
+    p = max(1, (total + 99) // 100)
+    scanned = 0
+    while p >= 1 and scanned < 10:
+        _, rows = _get("/candidates?stageStatuses=evaluated_all&page=%d" % p)
+        rows = [] if not rows else ([rows] if isinstance(rows, dict) else rows)
+        scanned += 1
+        if not rows:
+            p -= 1
+            continue
+        for c in rows:
+            r = None
+            for s in (c.get("stages") or []):
+                if s.get("type") == "resume":
+                    r = s
+            if not r:
+                continue
+            if r.get("fixedAt") or r.get("status") in ("fail", "pass"):
+                continue  # 既に確定済み＝判定待ちでない
+            reason, verdict, ev_at = _resume_evaluation(c.get("id"))
+            if not ev_at:
+                continue
+            if ev_at < floor:
+                stale += 1
+                continue
+            is_agent = c.get("channelType") == "agent"
+            key = ("no_verdict" if verdict is None
+                   else ("pass_" if verdict else "fail_") + ("agent" if is_agent else "direct"))
+            groups[key].append({
+                "id": c.get("id"),
+                "name": ((c.get("lastName") or "") + (c.get("firstName") or "")),
+                "position": (c.get("requisition") or {}).get("name"),
+                "channel": (c.get("agentCompany") or {}).get("name") or c.get("channelName") or c.get("channelType"),
+                "evaluatedAt": ev_at.isoformat(),
+                "waitingDays": round((now - ev_at).total_seconds() / 86400, 1),
+                "reason": reason,
+                "url": c.get("url"),
+            })
+        p -= 1
+    for k in groups:
+        groups[k].sort(key=lambda x: x["evaluatedAt"])
+    need = len(groups["pass_agent"]) + len(groups["pass_direct"]) + len(groups["fail_direct"])
+    print(json.dumps({"action_needed_count": need, "stale_excluded": stale,
+                      "counts": {k: len(v) for k, v in groups.items()}, "groups": groups},
+                     ensure_ascii=False, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="action", required=True)
@@ -462,6 +529,7 @@ def main():
     g = sub.add_parser("tagsync"); g.add_argument("--hours", type=float, default=168); g.add_argument("--dry-run", action="store_true")
     rj = sub.add_parser("rejected"); rj.add_argument("--days", type=float, default=30)
     pd = sub.add_parser("pending"); pd.add_argument("--hours", type=float, default=2); pd.add_argument("--max-days", type=float, default=14)
+    aw = sub.add_parser("awaiting"); aw.add_argument("--days", type=float, default=30)
     args = ap.parse_args()
 
     if args.action == "new":
@@ -483,6 +551,8 @@ def main():
         rejected(args.days)
     elif args.action == "pending":
         pending(args.hours, args.max_days)
+    elif args.action == "awaiting":
+        awaiting(args.days)
 
 
 if __name__ == "__main__":
