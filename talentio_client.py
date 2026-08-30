@@ -520,6 +520,11 @@ def awaiting(days):
                      ensure_ascii=False, indent=2))
 
 
+def _is_test(c):
+    """検証用ダミー（氏名に「テスト」を含む候補者）はすべての通知対象から除外する。"""
+    return "テスト" in ((c.get("lastName") or "") + (c.get("firstName") or ""))
+
+
 def passed(days, req_ids):
     """書類選考を通過した候補者と、その後の面接設定の進み具合を返す（面接官起点フロー①用）。
 
