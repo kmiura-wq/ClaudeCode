@@ -520,6 +520,69 @@ def awaiting(days):
                      ensure_ascii=False, indent=2))
 
 
+def passed(days, req_ids):
+    """書類選考を通過した候補者と、その後の面接設定の進み具合を返す（面接官起点フロー①用）。
+
+    通過 = resumeステージ status==pass かつ fixedAt が days 日以内。チャネルは問わない。
+    req_ids（requisition id の集合）を指定するとそのポジションのみ。空なら全ポジション。
+
+    面接官起点フロー（2026-08-30〜 fondeskパイロット）での使い方：
+      interviewStageCreated=False … 面接官がまだ日程調整を発行していない → 面接官へ依頼/リマインド
+      Created=True & Scheduled=False … 発行済みだが候補者が未選択 → リンク送付漏れ or 候補者放置の疑い
+      Scheduled=True … 確定済み。対応不要（採用カレンダーへはGASが転記）
+
+    stalled と同じく status=ongoing で絞るのでAPIは数リクエストで済む。
+    """
+    now = datetime.datetime.now(JST)
+    since = now - datetime.timedelta(days=days)
+    headers, first = _get("/candidates?status=ongoing&page=1")
+    total = int(headers.get("x-total") or 0)
+    if total > 3000:
+        sys.exit("[ERROR] status=ongoing filter appears to be ignored (X-Total=%d)." % total)
+    rows = [] if not first else ([first] if isinstance(first, dict) else list(first))
+    for p in range(2, max(1, (total + 99) // 100) + 1):
+        _, r = _get("/candidates?status=ongoing&page=%d" % p)
+        rows += [] if not r else ([r] if isinstance(r, dict) else list(r))
+
+    out, excluded_test = [], 0
+    for c in rows:
+        if c.get("status") != "ongoing":
+            continue
+        rq = c.get("requisition") or {}
+        if req_ids and rq.get("id") not in req_ids:
+            continue
+        if _is_test(c):
+            excluded_test += 1
+            continue
+        resume, nxt = None, []
+        for s in (c.get("stages") or []):
+            if s.get("type") == "resume":
+                resume = s
+            elif s.get("type") in ("interview", "contact"):
+                nxt.append(s)
+        if not resume or resume.get("status") != "pass":
+            continue
+        fx = _parse_dt(resume.get("fixedAt"))
+        if not fx or fx < since:
+            continue
+        out.append({
+            "id": c.get("id"),
+            "name": ((c.get("lastName") or "") + " " + (c.get("firstName") or "")).strip(),
+            "position": rq.get("name"), "requisitionId": rq.get("id"),
+            "channel": (c.get("agentCompany") or {}).get("name") or c.get("channelName") or c.get("channelType"),
+            "channelType": c.get("channelType"),
+            "passedAt": resume.get("fixedAt"),
+            "waitingHours": round((now - fx).total_seconds() / 3600, 1),
+            "interviewStageCreated": len(nxt) > 0,
+            "interviewScheduled": any(s.get("scheduledAt") for s in nxt),
+            "url": c.get("url") or ("https://talentio.com/r/ats/candidates/%s" % c.get("id")),
+        })
+    out.sort(key=lambda x: x["passedAt"] or "", reverse=True)
+    print(json.dumps({"scanned_ongoing": len(rows), "excluded_test": excluded_test,
+                      "days": days, "count": len(out), "items": out},
+                     ensure_ascii=False, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="action", required=True)
@@ -530,6 +593,7 @@ def main():
     rj = sub.add_parser("rejected"); rj.add_argument("--days", type=float, default=30)
     pd = sub.add_parser("pending"); pd.add_argument("--hours", type=float, default=2); pd.add_argument("--max-days", type=float, default=14)
     aw = sub.add_parser("awaiting"); aw.add_argument("--days", type=float, default=30)
+    ps = sub.add_parser("passed"); ps.add_argument("--days", type=float, default=5); ps.add_argument("--requisitions", default="", help="requisition idをカンマ区切り。空なら全ポジション")
     args = ap.parse_args()
 
     if args.action == "new":
@@ -553,6 +617,9 @@ def main():
         pending(args.hours, args.max_days)
     elif args.action == "awaiting":
         awaiting(args.days)
+    elif args.action == "passed":
+        ids = set(int(x) for x in args.requisitions.split(",") if x.strip())
+        passed(args.days, ids)
 
 
 if __name__ == "__main__":
