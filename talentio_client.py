@@ -197,7 +197,10 @@ def stagesync(hours, dry_run):
 #   AIが管理するのは「求人番号・チャネルから一意に決まる属性タグ」だけ。
 #   選考フェーズのタグ（通過－書類選考／カジュアル面談済み／不合格－1次面接 等）は
 #   積み上げ/置換の運用が人により異なり、実運用の語彙も網羅できないため **一切触らない**。
-MANAGED_TAGS = ["中途", "28卒", "28卒-ビジネス", "28卒-エンジニア", "スカウト経由"]
+# 2026-09-02 伏見さん要望：新卒タグ（28卒/28卒-ビジネス/28卒-エンジニア）はAIの管理対象から除外。
+# 新卒はファーストアクションが分岐するため「タグ無し＝未着手」を人の目視サインとして使う。
+# MANAGED_TAGSから外すことで、AIは新卒タグを**付けも剥がしもしない**（伏見さんの手付けタグを保護）。
+MANAGED_TAGS = ["中途", "スカウト経由"]
 SCOUT_CHANNELS = ["ビズリーチ", "LAPRAS", "Findy", "YOUTRUST", "転職ドラフト", "bizreach", "lapras", "findy"]
 
 
@@ -214,12 +217,8 @@ def _desired_tags(c):
     for s in (c.get("stages") or []):
         if s.get("type") == "resume" and s.get("status") == "fail" and s.get("fixedAt"):
             want.add("不合格－書類選考")
-    if "28卒" in req_name:
-        want.add("28卒")
-        if any(k in req_name for k in ["ビジネス", "BPO", "セールス"]):
-            want.add("28卒-ビジネス")
-        elif any(k in req_name for k in ["エンジニア", "3days"]):
-            want.add("28卒-エンジニア")
+    if "28卒" in req_name or "卒" in req_name and _pos_num(req_name) in ("26", "27", "28", "29"):
+        pass  # 新卒タグは付与しない（2026-09-02〜 伏見さんが手動付与＝「タグ無し=未着手」のサイン）
     elif _pos_num(req_name):
         want.add("中途")
     if ch_type != "agent" and any(s in ch_name for s in SCOUT_CHANNELS):
